@@ -52,9 +52,14 @@ void setup() {
     Serial.println("Barometer error!");
   }
   ps.enableDefault();
+  while(1){
   if(!SD.begin(10)){
     Serial.println("Card Error!");
-      while(1){};
+    delay(1000);
+  }
+  else{
+    break;
+  }
   }
   Serial.println("Initializing Card...");
   
@@ -92,7 +97,7 @@ void loop() {
       int16_t xmag, ymag, zmag;
       int16_t temp;
     } packet = {
-      0x5555AAAA, currentTime, pressure,
+      0x5555AAAA, start_time, pressure,
       gyro_acc.a.x, gyro_acc.a.y, gyro_acc.a.z,
       gyro_acc.g.x, gyro_acc.g.y, gyro_acc.g.z,
       mag.m.x, mag.m.y, mag.m.z,
