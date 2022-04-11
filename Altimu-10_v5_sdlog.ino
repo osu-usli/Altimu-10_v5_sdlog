@@ -5,12 +5,21 @@
 #include "SX128XLT.h"
 #include <SoftwareSerial.h>
 
+#include "LowPass.h"
+
 #define SD_CS 9
 #define NSS 10
 #define RFBUSY 6
 #define NRESET 5
 #define DIO1 2
 #define LED1 4
+
+#define RANGING_TIME 1000
+#define IMU_INTERVAL 100
+
+#define IMU_SAMPLES 10
+#define ACC_SCALE 2048
+#define LAUNCH_THRESHOLD 4.0
 
 #define LORA_DEVICE DEVICE_SX1280                //we need to define the device we are using
 const uint32_t Frequency = 2445000000;           //frequency of transmissions in hz
@@ -20,7 +29,7 @@ const uint8_t SpreadingFactor = LORA_SF8;        //LoRa spreading factor
 const uint8_t CodeRate = LORA_CR_4_5;            //LoRa coding rate
 const uint16_t Calibration = 11350;              //Manual Ranging calibrarion value
 
-const int8_t RangingTXPower = 10;                //Transmit power used
+const int8_t RangingTXPower = 12;                //Transmit power used
 const uint32_t RangingAddress = 16;              //must match address in recever
 
 
@@ -50,17 +59,7 @@ void setup() {
   //gyro init
   gyro_acc.writeReg(LSM6::CTRL2_G, 0x4C);
 
-//   gyro_acc.readGyro();
-//   gyro_x = gyro_acc.g.x;
-//   gyro_y = gyro_acc.g.y;
-//   gyro_z = gyro_acc.g.z;
-//
-//  gyro_acc.readAcc();
-//  accel_x = gyro_acc.a.x >> 4;
-//  accel_y = gyro_acc.a.y >> 4;
-//  accel_z = gyro_acc.a.z >> 4;
-//  
-  Serial.begin(9600);
+  Serial.begin(115200);
   SPI.begin();
   while(!Serial){
   }
@@ -80,41 +79,61 @@ void setup() {
 }
 
 void loop() {
+  static unsigned long last_imu_time;
+  static long launch_pressure;
+  static LowPass<long, IMU_SAMPLES> pressure;
+  static LowPass<float, IMU_SAMPLES> acceleration;
+  
   double distance = -1;
   tof.setupRanging(Frequency, Offset, SpreadingFactor, Bandwidth, CodeRate, RangingAddress, RANGING_MASTER);
 
+  double latest_acc;
+  long latest_pressure;
+
   start_time = millis();
-  for (int i = 0; i < 10; i++) {
-    tof.transmitRanging(RangingAddress, 2000, RangingTXPower, WAIT_TX);
+  while (millis() < start_time + RANGING_TIME) {
+    tof.transmitRanging(RangingAddress, 500, RangingTXPower, NO_WAIT);
+
+    while (!digitalRead(DIO1)) {
+      if (last_imu_time + IMU_INTERVAL < millis()) {
+        last_imu_time = millis();
+        gyro_acc.readAcc();
+
+        double x = gyro_acc.a.x / (double)ACC_SCALE;
+        double y = gyro_acc.a.y / (double)ACC_SCALE;
+        double z = gyro_acc.a.z / (double)ACC_SCALE;
+        latest_acc = acceleration.update(sqrt(x*x + y*y + z*z));
+        latest_pressure = pressure.update(ps.readPressureRaw());
+
+        if (latest_acc > LAUNCH_THRESHOLD) {
+          // TODO: send a signal to the Pis
+          launch_pressure = latest_pressure;
+        }
+      }
+    }
+    
     uint16_t irqStatus = tof.readIrqStatus();
     if (irqStatus & IRQ_RANGING_MASTER_RESULT_VALID) {
       Serial.print("Ranging result valid: ");
       int32_t range_result = tof.getRangingResultRegValue(RANGING_RESULT_RAW);
       distance = tof.getRangingDistance(RANGING_RESULT_RAW, range_result, 1);
       Serial.println(distance);
-      break;
     } else {
       Serial.println("Ranging result NOT valid");
     }
   }
   
-  gyro_acc.readGyro();
-  gyro_acc.readAcc();
-  long pressure = ps.readPressureRaw();
   int temp = ps.readTemperatureRaw();
+  
   struct {
     uint32_t marker;
     uint32_t time;
     int32_t pressure;
-    int16_t xacc, yacc, zacc;
-    int16_t xgy, ygy, zgy;
+    double acc;
     int16_t temp;
     double distance;
   } packet = {
-    0x5555AAAA, start_time, pressure,
-    gyro_acc.a.x, gyro_acc.a.y, gyro_acc.a.z,
-    gyro_acc.g.x, gyro_acc.g.y, gyro_acc.g.z,
-    temp, distance
+    0x5555AAAA, start_time, latest_pressure, latest_acc, temp, distance
   };
 
   
@@ -124,11 +143,14 @@ void loop() {
   tof.setRfFrequency(Frequency, Offset);
   tof.setBufferBaseAddress(0, 0);
   tof.setModulationParams(SpreadingFactor, Bandwidth, CodeRate);
-  tof.setPacketParams(12, LORA_PACKET_VARIABLE_LENGTH, 255, LORA_CRC_ON, LORA_IQ_NORMAL, 0, 0);
+  tof.setPacketParams(12, LORA_PACKET_VARIABLE_LENGTH, 250, LORA_CRC_ON, LORA_IQ_NORMAL, 0, 0);
   tof.setDioIrqParams(IRQ_RADIO_ALL, (IRQ_TX_DONE + IRQ_RX_TX_TIMEOUT), 0, 0);
   tof.setHighSensitivity();
   Serial.flush();
-  uint8_t len = tof.transmit((byte*)&packet, sizeof(packet), 1000, RangingTXPower, WAIT_TX);
+  uint8_t len;
+  for (int i = 0; i < 10; i++) {
+    len = tof.transmit((byte*)&packet, sizeof(packet), 1000, RangingTXPower, NO_WAIT);
+  }
   Serial.print("transmitted: ");
   Serial.println(len);
   piserial.write((byte*)&packet, sizeof(packet));
