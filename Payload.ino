@@ -4,6 +4,7 @@
 #include <LPS.h>
 #include "SX128XLT.h"
 #include <SoftwareSerial.h>
+#include <limits.h>
 
 #include "LowPass.h"
 
@@ -17,9 +18,23 @@
 #define RANGING_TIME 1000
 #define IMU_INTERVAL 100
 
+#define LANDING_TIMEOUT (1000*150)
+
 #define IMU_SAMPLES 10
 #define ACC_SCALE 2048
-#define LAUNCH_THRESHOLD 4.0
+#define LAUNCH_THRESHOLD_G 4.0
+#define LANDING_THRESHOLD_MIN_G 0.8
+#define LANDING_THRESHOLD_MAX_G 1.2
+#define LANDING_THRESHOLD_NUM_SAMPLES 100
+
+// The horizontal displacement from the launchpad to the tent in feet (east is positive)
+#define TENT_X 0
+
+// The vertical displacement from the launchpad to the tent in feet (south is positive)
+#define TENT_Y -350
+
+#define GRID_SQUARE_SIZE_FEET 250
+#define FIELD_SIZE_SQUARES 20
 
 #define LORA_DEVICE DEVICE_SX1280                //we need to define the device we are using
 const uint32_t Frequency = 2445000000;           //frequency of transmissions in hz
@@ -33,20 +48,22 @@ const int8_t RangingTXPower = 12;                //Transmit power used
 const uint32_t RangingAddress = 16;              //must match address in recever
 
 
-SoftwareSerial piserial(A0, A1);
+SoftwareSerial piserial1(A0, A1);
+SoftwareSerial piserial2(7, 8);
+
+#define PI1_FLAG A3
+#define PI2_FLAG A2
 
 LSM6 gyro_acc;
-LPS ps;
 SX128XLT tof;
 
-//float accel = 3.1459;
-//float gyro = 10.2;
 unsigned long start_time;
-int x=0;
-unsigned long startertime;
 
 void setup() {
-  piserial.begin(9600);
+  pinMode(PI1_FLAG, OUTPUT);
+  digitalWrite(PI1_FLAG, LOW);
+  pinMode(PI2_FLAG, OUTPUT);
+  digitalWrite(PI2_FLAG, LOW);
 
   //I2C_Init();
   Wire.begin();
@@ -61,7 +78,7 @@ void setup() {
 
   Serial.begin(115200);
   SPI.begin();
-  while(!Serial){
+  while (!Serial) {
   }
 
   if (!tof.begin(NSS, NRESET, RFBUSY, DIO1, DEVICE_SX1280)) {
@@ -71,24 +88,20 @@ void setup() {
   }
 
   tof.setupRanging(Frequency, Offset, SpreadingFactor, Bandwidth, CodeRate, RangingAddress, RANGING_MASTER);
-  
-  if(!ps.init()){
-    Serial.println("Barometer error!");
-  }
-  ps.enableDefault();
 }
 
 void loop() {
   static unsigned long last_imu_time;
-  static long launch_pressure;
-  static LowPass<long, IMU_SAMPLES> pressure;
+  static bool launched;
   static LowPass<float, IMU_SAMPLES> acceleration;
+  static LowPass<float, IMU_SAMPLES> distance;
+  static unsigned landing_samples;
+  static double latest_acc;
+  static double latest_distance;
+  static unsigned long launch_time;
   
-  double distance = -1;
   tof.setupRanging(Frequency, Offset, SpreadingFactor, Bandwidth, CodeRate, RangingAddress, RANGING_MASTER);
 
-  double latest_acc;
-  long latest_pressure;
 
   start_time = millis();
   while (millis() < start_time + RANGING_TIME) {
@@ -102,41 +115,105 @@ void loop() {
         double x = gyro_acc.a.x / (double)ACC_SCALE;
         double y = gyro_acc.a.y / (double)ACC_SCALE;
         double z = gyro_acc.a.z / (double)ACC_SCALE;
-        latest_acc = acceleration.update(sqrt(x*x + y*y + z*z));
-        latest_pressure = pressure.update(ps.readPressureRaw());
+        latest_acc = acceleration.update(sqrt(x * x + y * y + z * z));
 
-        if (latest_acc > LAUNCH_THRESHOLD) {
-          // TODO: send a signal to the Pis
-          launch_pressure = latest_pressure;
+        if (!launched && latest_acc > LAUNCH_THRESHOLD_G) {
+          digitalWrite(PI1_FLAG, HIGH);
+          digitalWrite(PI2_FLAG, HIGH);
+          Serial.print("Launched: ");
+          Serial.println(latest_acc);
+          launched = true;
+          launch_time = millis();
+        } else if (launched && latest_acc > LANDING_THRESHOLD_MIN_G && latest_acc < LANDING_THRESHOLD_MAX_G) {
+          if (++landing_samples > LANDING_THRESHOLD_NUM_SAMPLES) {
+            // we've landed!
+            Serial.println("Landed");
+            landed(latest_distance);
+          }
+        } else {
+          landing_samples = 0;
         }
       }
+
+      if (launched && millis() - launch_time > LANDING_TIMEOUT) {
+        Serial.println("Launch timeout");
+        landed(latest_distance);
+      }
     }
-    
     uint16_t irqStatus = tof.readIrqStatus();
     if (irqStatus & IRQ_RANGING_MASTER_RESULT_VALID) {
       Serial.print("Ranging result valid: ");
       int32_t range_result = tof.getRangingResultRegValue(RANGING_RESULT_RAW);
-      distance = tof.getRangingDistance(RANGING_RESULT_RAW, range_result, 1);
-      Serial.println(distance);
+      float distance_sample = tof.getRangingDistance(RANGING_RESULT_RAW, range_result, 1);
+      distance_sample = distance_sample * 10 / 3; // convert to feet
+      Serial.println(distance_sample);
+      latest_distance = distance.update(distance_sample);
     } else {
       Serial.println("Ranging result NOT valid");
     }
   }
-  
-  int temp = ps.readTemperatureRaw();
-  
-  struct {
-    uint32_t marker;
-    uint32_t time;
-    int32_t pressure;
-    double acc;
-    int16_t temp;
-    double distance;
-  } packet = {
-    0x5555AAAA, start_time, latest_pressure, latest_acc, temp, distance
-  };
+}
 
-  
+void landed(float tof_distance) {
+  digitalWrite(PI1_FLAG, LOW);
+  digitalWrite(PI2_FLAG, LOW);
+
+  uint32_t colors[3] = {0};
+  uint32_t colors_2[3] = {0};
+
+  Serial.println("Waiting for pi1...");
+  // pi1 will print once its flag goes high
+  // in case something is wrong/desynced, pulse its flag to make sure it eventually gets the message
+  piserial1.begin(9600);
+  while (!piserial1.available()) {
+    digitalWrite(PI1_FLAG, !digitalRead(PI1_FLAG));
+    delay(1000);
+  }
+  piserial1.readBytes((byte*)colors, sizeof(colors));
+
+  Serial.println("Waiting for pi2...");
+  piserial2.begin(9600);
+  while (!piserial2.available()) {
+    digitalWrite(PI2_FLAG, !digitalRead(PI2_FLAG));
+    delay(1000);
+  }
+  piserial2.readBytes((byte*)colors_2, sizeof(colors_2));
+
+  for (int i = 0; i < 3; i++) colors[i] += colors_2[i];
+
+  // Colors are returned in the order green (west-facing), orange (north), blue (east)
+  // Choose the best adjacent pair
+  float color_a;
+  float color_b;
+  float angle;
+  if (colors[0] + colors[1] > colors[1] + colors[2]) {
+    Serial.println("Using green & orange");
+    color_a = colors[0];
+    color_b = colors[1];
+    angle = 0;
+  } else {
+    Serial.println("Using orange & blue");
+    color_a = colors[1];
+    color_b = colors[2];
+    angle = M_PI / 2;
+  }
+
+  // If we're facing fully towards color_a, angle += 0
+  // If we're facing fully towards color_b, angle += 90
+  angle += atan2(color_b, color_a);
+
+  float x = TENT_X - tof_distance * cos(angle);
+  float y = TENT_Y - tof_distance * sin(angle);
+
+  int grid_square_x = round(x / GRID_SQUARE_SIZE_FEET) + FIELD_SIZE_SQUARES / 2;
+  int grid_square_y = round(y / GRID_SQUARE_SIZE_FEET) + FIELD_SIZE_SQUARES / 2;
+
+  int16_t grid_square = grid_square_y * FIELD_SIZE_SQUARES + grid_square_x + 1; // 1-based index
+
+  Serial.print("gridsquare "); Serial.print(grid_square);
+  Serial.print(" ("); Serial.print(grid_square_x);
+  Serial.print(", "); Serial.print(grid_square_y); Serial.println(")");
+
   tof.setMode(MODE_STDBY_RC);
   tof.setRegulatorMode(USE_LDO);
   tof.setPacketType(PACKET_TYPE_LORA);
@@ -146,13 +223,8 @@ void loop() {
   tof.setPacketParams(12, LORA_PACKET_VARIABLE_LENGTH, 250, LORA_CRC_ON, LORA_IQ_NORMAL, 0, 0);
   tof.setDioIrqParams(IRQ_RADIO_ALL, (IRQ_TX_DONE + IRQ_RX_TX_TIMEOUT), 0, 0);
   tof.setHighSensitivity();
-  Serial.flush();
-  uint8_t len;
-  for (int i = 0; i < 10; i++) {
-    len = tof.transmit((byte*)&packet, sizeof(packet), 1000, RangingTXPower, NO_WAIT);
+
+  for (;;) {
+    tof.transmit((byte*)&grid_square, sizeof(grid_square), 1000, RangingTXPower, WAIT_TX);
   }
-  Serial.print("transmitted: ");
-  Serial.println(len);
-  piserial.write((byte*)&packet, sizeof(packet));
-  piserial.flush();
 }
