@@ -15,9 +15,12 @@
 #define DIO1 2
 #define LED1 4
 
-#define RANGING_TIME 1000
 #define IMU_INTERVAL 100
 
+// FIXME: the following line has an integer overflow and should be changed to (1000L*150).
+// This bug caused the timeout to fire after about 18 seconds, rather than the full 2.5 minutes.
+// In the interest of preserving the competition behavior, this line has not been updated. However,
+// if a future team reuses this code -- be sure to fix it!
 #define LANDING_TIMEOUT (1000*150)
 
 #define IMU_SAMPLES 10
@@ -57,9 +60,8 @@ SoftwareSerial piserial2(7, 8);
 LSM6 gyro_acc;
 SX128XLT tof;
 
-unsigned long start_time;
-
 void setup() {
+  // Tell the Pis to stand by waiting for launch
   pinMode(PI1_FLAG, OUTPUT);
   digitalWrite(PI1_FLAG, LOW);
   pinMode(PI2_FLAG, OUTPUT);
@@ -103,58 +105,66 @@ void loop() {
   tof.setupRanging(Frequency, Offset, SpreadingFactor, Bandwidth, CodeRate, RangingAddress, RANGING_MASTER);
 
 
-  start_time = millis();
-  while (millis() < start_time + RANGING_TIME) {
-    tof.transmitRanging(RangingAddress, 500, RangingTXPower, NO_WAIT);
+  // Transmit a ToF packet.
+  tof.transmitRanging(RangingAddress, 500, RangingTXPower, NO_WAIT);
 
-    while (!digitalRead(DIO1)) {
-      if (last_imu_time + IMU_INTERVAL < millis()) {
-        last_imu_time = millis();
-        gyro_acc.readAcc();
+  // Until we recieve a ranging response, or we timeout...
+  while (!digitalRead(DIO1)) {
+    // Should we poll the IMU?
+    if (last_imu_time + IMU_INTERVAL < millis()) {
+      last_imu_time = millis();
+      gyro_acc.readAcc();
 
-        double x = gyro_acc.a.x / (double)ACC_SCALE;
-        double y = gyro_acc.a.y / (double)ACC_SCALE;
-        double z = gyro_acc.a.z / (double)ACC_SCALE;
-        latest_acc = acceleration.update(sqrt(x * x + y * y + z * z));
+      // Compute total acceleration and run it through the low-pass filter.
+      double x = gyro_acc.a.x / (double)ACC_SCALE;
+      double y = gyro_acc.a.y / (double)ACC_SCALE;
+      double z = gyro_acc.a.z / (double)ACC_SCALE;
+      latest_acc = acceleration.update(sqrt(x * x + y * y + z * z));
 
-        if (!launched && latest_acc > LAUNCH_THRESHOLD_G) {
-          digitalWrite(PI1_FLAG, HIGH);
-          digitalWrite(PI2_FLAG, HIGH);
-          Serial.print("Launched: ");
-          Serial.println(latest_acc);
-          launched = true;
-          launch_time = millis();
-        } else if (launched && latest_acc > LANDING_THRESHOLD_MIN_G && latest_acc < LANDING_THRESHOLD_MAX_G) {
-          if (++landing_samples > LANDING_THRESHOLD_NUM_SAMPLES) {
-            // we've landed!
-            Serial.println("Landed");
-            landed(latest_distance);
-          }
-        } else {
-          landing_samples = 0;
+      if (!launched && latest_acc > LAUNCH_THRESHOLD_G) {
+        // Acceleration exceeds the launch threshold; tell the Pis to start capturing images.
+        digitalWrite(PI1_FLAG, HIGH);
+        digitalWrite(PI2_FLAG, HIGH);
+        Serial.print("Launched: ");
+        Serial.println(latest_acc);
+        launched = true;
+        launch_time = millis();
+      } else if (launched && latest_acc > LANDING_THRESHOLD_MIN_G && latest_acc < LANDING_THRESHOLD_MAX_G) {
+        // Acceleration is within the landing range.
+        if (++landing_samples > LANDING_THRESHOLD_NUM_SAMPLES) {
+          // Acceleration has been within the landing range for a while now.
+          // we've landed!
+          Serial.println("Landed");
+          landed(latest_distance);
         }
+      } else {
+        landing_samples = 0;
       }
+    }
 
-      if (launched && millis() - launch_time > LANDING_TIMEOUT) {
-        Serial.println("Launch timeout");
-        landed(latest_distance);
-      }
+    if (launched && millis() - launch_time > LANDING_TIMEOUT) {
+      // We haven't detect the landing, but it's so long since launch we must have landed by now.
+      Serial.println("Launch timeout");
+      landed(latest_distance);
     }
-    uint16_t irqStatus = tof.readIrqStatus();
-    if (irqStatus & IRQ_RANGING_MASTER_RESULT_VALID) {
-      Serial.print("Ranging result valid: ");
-      int32_t range_result = tof.getRangingResultRegValue(RANGING_RESULT_RAW);
-      float distance_sample = tof.getRangingDistance(RANGING_RESULT_RAW, range_result, 1);
-      distance_sample = distance_sample * 10 / 3; // convert to feet
-      Serial.println(distance_sample);
-      latest_distance = distance.update(distance_sample);
-    } else {
-      Serial.println("Ranging result NOT valid");
-    }
+  }
+
+  // What was the result of the ToF ranging?
+  uint16_t irqStatus = tof.readIrqStatus();
+  if (irqStatus & IRQ_RANGING_MASTER_RESULT_VALID) {
+    Serial.print("Ranging result valid: ");
+    int32_t range_result = tof.getRangingResultRegValue(RANGING_RESULT_RAW);
+    float distance_sample = tof.getRangingDistance(RANGING_RESULT_RAW, range_result, 1);
+    distance_sample = distance_sample * 10 / 3; // convert to feet
+    Serial.println(distance_sample);
+    latest_distance = distance.update(distance_sample);
+  } else {
+    Serial.println("Ranging result NOT valid");
   }
 }
 
 void landed(float tof_distance) {
+  // Tell the Pis to start computing the result.
   digitalWrite(PI1_FLAG, LOW);
   digitalWrite(PI2_FLAG, LOW);
 
@@ -214,6 +224,7 @@ void landed(float tof_distance) {
   Serial.print(" ("); Serial.print(grid_square_x);
   Serial.print(", "); Serial.print(grid_square_y); Serial.println(")");
 
+  // Switch the radio to data mode.
   tof.setMode(MODE_STDBY_RC);
   tof.setRegulatorMode(USE_LDO);
   tof.setPacketType(PACKET_TYPE_LORA);
@@ -224,6 +235,7 @@ void landed(float tof_distance) {
   tof.setDioIrqParams(IRQ_RADIO_ALL, (IRQ_TX_DONE + IRQ_RX_TX_TIMEOUT), 0, 0);
   tof.setHighSensitivity();
 
+  // Repeatedly transmit the grid square until somebody powers us off.
   for (;;) {
     tof.transmit((byte*)&grid_square, sizeof(grid_square), 1000, RangingTXPower, WAIT_TX);
   }

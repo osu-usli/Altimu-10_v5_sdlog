@@ -1,3 +1,4 @@
+// A simple low-pass filter that takes the average of the past N samples.
 template<typename T, int N>
 struct LowPass {
     T buf[N];
@@ -7,6 +8,7 @@ struct LowPass {
     LowPass() : buf{0}, i(0), err(0) {
     }
 
+    // Updates the filter with a new sample, returning the new average.
     T update(T val) {
         buf[i++] = val;
         i %= N;
