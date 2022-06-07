@@ -1,3 +1,6 @@
+### GitHub Repository
+https://github.com/osu-usli/Payload
+
 # OSU USLI 2021-2022 Payload software
 
 This repository contains the software for the Arduino on the rocket payload. This Arduino is connected to an AltIMU-v10 inertial measurement unit, a SX1280 radio time-of-flight and communication module, and the two Raspberry Pis used for vision processing.
@@ -15,3 +18,5 @@ The Arduino is in charge of detecting launch and landing, controlling time-of-fl
 - Wait for the Raspberry Pis to return vision processing results over serial.
 - Use the vision processing results to estimate the rocket's bearing to the tent. Combine this with the latest time-of-flight distance measurement to compute a grid square.
 - Repeatedly transmit the grid square to the base station using the time-of-flight module.
+
+Besides the standard Arduino SDK, this software depends on the [LSM6](https://www.arduino.cc/reference/en/libraries/lsm6/) and [LPS](https://www.arduino.cc/reference/en/libraries/lps/) libraries, which you can install using the Library Manager in the Arduino IDE. Once the libraries are installed, the `Payload.ino` file will compile and run using the Arduino IDE.
